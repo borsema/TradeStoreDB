@@ -339,8 +339,3 @@ as `expired = 'Y'`.
 | `DATABASE_URL` | SQLite file | Full SQLAlchemy DB URI for production |
 | `SECRET_KEY` | dev key | Flask secret key — change in production |
 
----
-
-## License
-
-MIT

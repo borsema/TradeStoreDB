@@ -1,0 +1,1282 @@
+================================================================================
+                    TRADESTOREDB — COMPLETE PROJECT DOCUMENTATION
+                    Written for: Manish Borse
+                    Date: October 2026
+================================================================================
+
+This document explains every single part of the TradeStoreDB project in plain
+language. It covers what the project does, how it is structured, how each file
+works, what the business rules are, how to run it, and how the tests work.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+  1.  What Is This Project?
+  2.  The Problem It Solves
+  3.  The Three Core Business Rules
+  4.  Technology Stack (What Tools Are Used)
+  5.  Project Folder Structure
+  6.  How The Application Starts (run.py)
+  7.  The Application Factory (app/__init__.py)
+  8.  Configuration (app/config.py)
+  9.  Database Extension (app/extensions.py)
+  10. Domain Exceptions (app/exceptions.py)
+  11. The Trade Model / Database Table (app/models/trade.py)
+  12. The Service Layer — Business Logic (app/services/trade_service.py)
+  13. The Routes / API Endpoints (app/routes/trade_routes.py)
+  14. All API Endpoints Explained
+  15. How Data Flows Through The Application
+  16. Dependencies (requirements.txt / requirements-dev.txt)
+  17. Tests — Overview
+  18. Test Fixtures (tests/conftest.py)
+  19. Model Tests (tests/test_models.py)
+  20. Service Tests (tests/test_service.py)
+  21. Route / Integration Tests (tests/test_routes.py)
+  22. Exception Tests (tests/test_exceptions.py)
+  23. CI/CD Pipeline (.github/workflows/ci.yml)
+  24. How To Run The Project
+  25. How To Run The Tests
+  26. Common Errors and What They Mean
+  27. Sample API Requests (curl Commands)
+  28. Glossary of Terms
+
+================================================================================
+1. WHAT IS THIS PROJECT?
+================================================================================
+
+TradeStoreDB is a REST API (web service) built using Python and Flask. It acts
+as a central "trade store" — a system that receives financial trade records from
+upstream systems and saves them in a database.
+
+Think of it like a ledger or register. Every time a financial trade happens
+(e.g., a stock trade, bond trade, etc.), the trade information is sent to this
+store. The store must validate the trade before saving it.
+
+The project demonstrates how to build a production-quality web API with:
+- Clean architecture (routes → service → model)
+- Business rule enforcement
+- Automated tests (80 tests, 99% code coverage)
+- CI/CD pipeline (GitHub Actions)
+
+================================================================================
+2. THE PROBLEM IT SOLVES
+================================================================================
+
+Thousands of trades are transmitted to a central store from upstream systems.
+These trades must be processed correctly. The system must:
+
+  a) Accept valid trades and save them.
+  b) Reject invalid trades with a clear error message.
+  c) Automatically mark old trades as "expired" when their maturity date passes.
+
+The sample data from the original problem statement:
+
+  | Trade ID | Version | Counter-Party | Portfolio | Maturity Date | Expired |
+  |----------|---------|---------------|-----------|---------------|---------|
+  | T1       | 1       | CP-1          | B1        | 20/05/2020*   | N       |
+  | T2       | 2       | CP-2          | B1        | 20/05/2021*   | N       |
+  | T2       | 1       | CP-1          | B1        | 20/05/2021*   | N       |
+  | T3       | 3       | CP-3          | B2        | 20/05/2014    | Y       |
+
+  (* Use future dates when testing so the maturity-date rule does not reject them)
+
+Key observations from sample data:
+- T2 appears twice with different versions. The store keeps only the LATEST version.
+- T3 has maturity date 20/05/2014 which is in the past → it should be REJECTED
+  or marked expired.
+- T2 version 1 arrives after version 2 → it should be REJECTED (lower version).
+
+================================================================================
+3. THE THREE CORE BUSINESS RULES
+================================================================================
+
+These rules are the heart of the application. Every trade must pass these checks
+before being saved.
+
+───────────────────────────────────────────────────────────────────────────────
+RULE 1: VERSION CHECK
+───────────────────────────────────────────────────────────────────────────────
+
+When a trade arrives:
+
+  - If the incoming version is LOWER than the already-stored version:
+    → REJECT the trade. Raise LowerVersionError (HTTP 400).
+
+  - If the incoming version is the SAME as the stored version:
+    → REPLACE (overwrite) the existing record with the new data.
+
+  - If the incoming version is HIGHER than the stored version:
+    → REPLACE (overwrite) the existing record with the new data.
+
+  - If the trade_id does not exist yet:
+    → INSERT a new record.
+
+WHY? Because trades can be re-transmitted. If version 2 is already stored and
+version 1 arrives later, version 1 is outdated and must be ignored.
+
+Example:
+  T2 v2 is stored first.
+  T2 v1 arrives later.
+  Result: T2 v1 is REJECTED because 1 < 2.
+
+───────────────────────────────────────────────────────────────────────────────
+RULE 2: MATURITY DATE CHECK
+───────────────────────────────────────────────────────────────────────────────
+
+Every trade has a "maturity date" — the date the trade expires/settles.
+
+  - If maturity_date < TODAY: REJECT the trade. Raise MaturityDateInPastError (HTTP 400).
+  - If maturity_date = TODAY: ACCEPTED (today is not "in the past").
+  - If maturity_date > TODAY: ACCEPTED.
+
+WHY? You cannot store a trade that has already matured before it was even
+received. It does not make business sense to accept a trade for a past date.
+
+Example:
+  T3 has maturity date 20/05/2014. Today is 2026. 2014 < 2026 → REJECTED.
+
+───────────────────────────────────────────────────────────────────────────────
+RULE 3: AUTO-EXPIRY
+───────────────────────────────────────────────────────────────────────────────
+
+Even after a trade is stored with a future maturity date, time passes. When
+the maturity date is reached (i.e., maturity_date < today), the trade must be
+automatically flagged as expired.
+
+  - The field "expired" in the database changes from "N" (No) to "Y" (Yes).
+  - This is triggered by calling the endpoint: POST /api/v1/trades/expire
+  - Typically this is scheduled to run every night via a cron job.
+
+WHY? A stored trade may have been valid when it was stored (future maturity),
+but over time its maturity date passes. The system must reflect that reality.
+
+================================================================================
+4. TECHNOLOGY STACK (WHAT TOOLS ARE USED)
+================================================================================
+
+Layer            | Technology             | Version   | Purpose
+-----------------|------------------------|-----------|----------------------------
+Language         | Python                 | 3.9 / 3.10 / 3.11 | All code is written in Python
+Web Framework    | Flask                  | 2.3.3     | Handles HTTP requests/responses
+ORM              | SQLAlchemy             | 2.0.23    | Maps Python objects to DB tables
+ORM Extension    | Flask-SQLAlchemy       | 3.1.1     | Integrates SQLAlchemy with Flask
+Database         | SQLite                 | Built-in  | Stores trade data in a file (dev)
+HTTP Layer       | Werkzeug               | 2.3.7     | Flask's underlying HTTP library
+Date Parsing     | python-dateutil        | 2.8.2     | Flexible date string parsing
+Schema Validation| marshmallow            | 3.20.1    | (installed, available for use)
+Testing          | pytest                 | 7.4.3     | Runs all tests
+Test Coverage    | pytest-cov             | 4.1.0     | Measures how much code is tested
+Security Scan    | safety                 | 3.2.3     | Scans dependencies for CVEs
+Code Style       | flake8                 | 7.0.0     | Enforces Python code style rules
+CI/CD            | GitHub Actions         | -         | Runs tests automatically on push
+Diagrams         | PlantUML               | -         | Architecture/flow diagrams
+
+SQLite is used for development and testing. For production, you can swap it
+with PostgreSQL or any other database by setting the DATABASE_URL environment
+variable.
+
+================================================================================
+5. PROJECT FOLDER STRUCTURE
+================================================================================
+
+TradeStoreDB/                          ← Root directory of the project
+│
+├── run.py                             ← Entry point: starts the Flask server
+│
+├── requirements.txt                   ← Production dependencies (Flask, SQLAlchemy...)
+├── requirements-dev.txt               ← Dev/test dependencies (pytest, safety...)
+│
+├── README.md                          ← Project overview and quick-start guide
+│
+├── app/                               ← Main application package
+│   ├── __init__.py                    ← Application factory (creates Flask app)
+│   ├── config.py                      ← Dev / Test / Production configuration
+│   ├── extensions.py                  ← SQLAlchemy db object (shared singleton)
+│   ├── exceptions.py                  ← Custom exception classes
+│   │
+│   ├── models/
+│   │   └── trade.py                   ← Trade database model (the table definition)
+│   │
+│   ├── routes/
+│   │   └── trade_routes.py            ← All 6 API endpoints
+│   │
+│   └── services/
+│       └── trade_service.py           ← All business logic (validation, CRUD)
+│
+├── tests/                             ← All test files
+│   ├── conftest.py                    ← Shared test setup (fixtures)
+│   ├── test_models.py                 ← Tests for the Trade model
+│   ├── test_service.py                ← Tests for the TradeService
+│   ├── test_routes.py                 ← Integration tests for API endpoints
+│   └── test_exceptions.py            ← Tests for custom exceptions
+│
+├── diagrams/                          ← PlantUML diagram source files
+│   ├── sequence_store_trade.puml      ← POST /trades flow diagram
+│   ├── sequence_read_expire.puml      ← GET/DELETE/expire flow diagrams
+│   ├── class_diagram.puml             ← Domain class diagram
+│   └── design_diagram.puml            ← System architecture diagram
+│
+└── .github/
+    └── workflows/
+        └── ci.yml                     ← GitHub Actions CI/CD pipeline
+
+================================================================================
+6. HOW THE APPLICATION STARTS (run.py)
+================================================================================
+
+File: run.py
+
+This is the file you run to start the server. It is the entry point.
+
+What it does step by step:
+  1. Reads the FLASK_ENV environment variable (defaults to "development").
+  2. Calls create_app(env) from the app package to build the Flask application.
+  3. Starts the Flask development web server on:
+       Host: 0.0.0.0  (accessible from any network interface)
+       Port: 5000
+       Debug: True (when in development mode)
+
+Code:
+  env = os.getenv("FLASK_ENV", "development")
+  app = create_app(env)
+  app.run(host="0.0.0.0", port=5000, debug=(env == "development"))
+
+To start the server:
+  python run.py
+
+The API will be available at: http://localhost:5000/api/v1
+
+To run in production mode:
+  FLASK_ENV=production python run.py
+
+================================================================================
+7. THE APPLICATION FACTORY (app/__init__.py)
+================================================================================
+
+File: app/__init__.py
+
+This file contains the create_app() function — a design pattern called the
+"Application Factory Pattern". Instead of creating the Flask app at module
+level, it creates it inside a function. This makes it easy to create multiple
+instances of the app (e.g., one for testing, one for production) with different
+configurations.
+
+What create_app() does step by step:
+  1. Creates a Flask app instance.
+  2. Loads configuration from config_by_name (based on environment name).
+  3. Initializes the database (db.init_app(app)).
+  4. Registers the trade Blueprint (URL prefix: /api/v1).
+  5. Creates all database tables (db.create_all()) inside an app context.
+  6. Returns the configured app.
+
+The Blueprint is how Flask groups related routes together. The "trades" Blueprint
+contains all the trade-related API endpoints and is registered with prefix /api/v1,
+so all routes become /api/v1/trades/...
+
+================================================================================
+8. CONFIGURATION (app/config.py)
+================================================================================
+
+File: app/config.py
+
+This file defines how the app behaves in different environments. There are three
+configurations, all inheriting from a shared BaseConfig.
+
+───────────────────────────────────────────────────────────────────────────────
+BaseConfig (parent of all configs)
+───────────────────────────────────────────────────────────────────────────────
+  SECRET_KEY              = "dev-secret-key-change-in-prod"
+                            (Used by Flask for session security)
+  SQLALCHEMY_TRACK_MODIFICATIONS = False
+                            (Disables a noisy SQLAlchemy feature)
+  JSON_SORT_KEYS          = False
+                            (Keeps JSON response key order as-is)
+
+───────────────────────────────────────────────────────────────────────────────
+DevelopmentConfig (used when FLASK_ENV=development)
+───────────────────────────────────────────────────────────────────────────────
+  DEBUG = True             → Shows detailed error pages
+  DATABASE_URL             → SQLite file: trade_store_dev.db in the project root
+                             (Can be overridden with DATABASE_URL env var)
+
+───────────────────────────────────────────────────────────────────────────────
+TestingConfig (used when FLASK_ENV=testing)
+───────────────────────────────────────────────────────────────────────────────
+  TESTING = True           → Enables Flask testing mode
+  DEBUG = False            → No debug output during tests
+  DATABASE_URL             → sqlite:///:memory:  (in-memory DB, no file created)
+                             This is important: every test run starts fresh!
+  WTF_CSRF_ENABLED = False → Disables CSRF protection in tests (not needed)
+
+───────────────────────────────────────────────────────────────────────────────
+ProductionConfig (used when FLASK_ENV=production)
+───────────────────────────────────────────────────────────────────────────────
+  DEBUG = False            → No debug output in production
+  DATABASE_URL             → Must be set via environment variable.
+                             Falls back to sqlite:///trade_store.db if not set.
+
+config_by_name dictionary:
+  "development"  → DevelopmentConfig
+  "testing"      → TestingConfig
+  "production"   → ProductionConfig
+  "default"      → DevelopmentConfig
+
+Environment Variables you can set:
+  FLASK_ENV     = development | testing | production
+  DATABASE_URL  = Full SQLAlchemy DB URI (e.g., postgresql://user:pass@host/db)
+  SECRET_KEY    = A strong random string (important for production)
+
+================================================================================
+9. DATABASE EXTENSION (app/extensions.py)
+================================================================================
+
+File: app/extensions.py
+
+This tiny file creates a single shared SQLAlchemy database object:
+
+  db = SQLAlchemy()
+
+WHY? Flask-SQLAlchemy needs one db object shared across the whole application.
+If you created it inside models/trade.py, the routes file would need to import
+it from there, creating messy circular imports.
+
+By putting it in extensions.py (a neutral location), all files can import db
+from the same place without circular dependencies:
+
+  from app.extensions import db   ← used in models, services, and tests
+
+================================================================================
+10. DOMAIN EXCEPTIONS (app/exceptions.py)
+================================================================================
+
+File: app/exceptions.py
+
+This file defines custom exception classes for trade-related errors. Using custom
+exceptions (instead of returning error strings directly) is a best practice because:
+  - It makes error handling clean and consistent
+  - The exception itself carries all error information
+  - The route layer just catches the exception and returns the right HTTP response
+
+───────────────────────────────────────────────────────────────────────────────
+TradeStoreError (base exception)
+───────────────────────────────────────────────────────────────────────────────
+  - Parent class for all trade exceptions
+  - Has a status_code (defaults to 400) and a message attribute
+  - All other exceptions inherit from this
+
+───────────────────────────────────────────────────────────────────────────────
+LowerVersionError
+───────────────────────────────────────────────────────────────────────────────
+  - Raised when: incoming trade version < stored version
+  - HTTP Status: 400 Bad Request
+  - Constructor: LowerVersionError(trade_id, incoming_version, stored_version)
+  - Message example: "Trade 'T2': incoming version 1 is lower than stored
+                      version 2. Trade rejected."
+  - Extra attributes: trade_id, incoming_version, stored_version
+
+───────────────────────────────────────────────────────────────────────────────
+MaturityDateInPastError
+───────────────────────────────────────────────────────────────────────────────
+  - Raised when: trade maturity_date < today
+  - HTTP Status: 400 Bad Request
+  - Constructor: MaturityDateInPastError(trade_id, maturity_date_string)
+  - Message example: "Trade 'T3': maturity date 20/05/2014 is in the past.
+                      Trade rejected."
+  - Extra attributes: trade_id, maturity_date
+
+───────────────────────────────────────────────────────────────────────────────
+TradeNotFoundError
+───────────────────────────────────────────────────────────────────────────────
+  - Raised when: a trade_id is looked up but does not exist in the database
+  - HTTP Status: 404 Not Found
+  - Constructor: TradeNotFoundError(trade_id)
+  - Message example: "Trade 'T99' not found."
+  - Extra attributes: trade_id
+
+================================================================================
+11. THE TRADE MODEL / DATABASE TABLE (app/models/trade.py)
+================================================================================
+
+File: app/models/trade.py
+
+This file defines the Trade class which maps directly to a database table called
+"trade". When the app starts, SQLAlchemy creates this table automatically.
+
+The Trade table has these columns:
+
+Column             | Type        | Required | Default    | Description
+-------------------|-------------|----------|------------|----------------------------
+id                 | Integer     | auto     | auto-incr  | Internal primary key (auto)
+trade_id           | String(20)  | Yes      | -          | Business identifier (T1, T2...)
+version            | Integer     | Yes      | -          | Version number of the trade
+counter_party_id   | String(50)  | Yes      | -          | The counterparty (CP-1, CP-2...)
+portfolio_id       | String(50)  | Yes      | -          | Portfolio (B1, B2...)
+maturity_date      | Date        | Yes      | -          | When the trade matures
+created_date       | Date        | Yes      | today      | When the trade was created
+expired            | String(1)   | Yes      | "N"        | "N" = active, "Y" = expired
+
+Important database constraints:
+  - id is the PRIMARY KEY (auto-incrementing integer)
+  - trade_id has an INDEX (makes lookups faster)
+  - UNIQUE CONSTRAINT on trade_id — only ONE active record per trade_id
+    This means when you upsert the same trade_id, the existing row is updated,
+    not a new row added.
+
+The to_dict() method:
+  This method converts a Trade object into a plain Python dictionary, suitable
+  for returning as a JSON response. Dates are formatted as "DD/MM/YYYY".
+
+  Example output:
+  {
+    "id": 1,
+    "trade_id": "T1",
+    "version": 1,
+    "counter_party_id": "CP-1",
+    "portfolio_id": "B1",
+    "maturity_date": "20/05/2030",
+    "created_date": "17/10/2026",
+    "expired": "N"
+  }
+
+The __repr__() method:
+  This is just for debugging. When you print a Trade object, it shows:
+  <Trade trade_id=T1 version=1 expired=N>
+
+================================================================================
+12. THE SERVICE LAYER — BUSINESS LOGIC (app/services/trade_service.py)
+================================================================================
+
+File: app/services/trade_service.py
+
+This is the most important file in the project. It contains all the business
+logic. The route file (trade_routes.py) is kept thin — it only handles HTTP.
+All actual work happens here.
+
+The TradeService class has these methods:
+
+───────────────────────────────────────────────────────────────────────────────
+store_trade(payload: dict) → Trade
+───────────────────────────────────────────────────────────────────────────────
+PURPOSE: Validate and save a single trade.
+
+INPUT (payload dict keys):
+  trade_id          - required
+  version           - required (converted to int)
+  counter_party_id  - required
+  portfolio_id      - required
+  maturity_date     - required (DD/MM/YYYY or YYYY-MM-DD or DD-MM-YYYY)
+  created_date      - optional (defaults to today)
+
+STEP-BY-STEP LOGIC:
+  Step 1: Extract and validate all required fields using _require() helper.
+          If any field is missing → raises ValueError.
+  Step 2: Parse maturity_date and created_date strings into Python date objects.
+          If date format is invalid → raises ValueError.
+  Step 3: RULE 2 CHECK — if maturity_date < today → raises MaturityDateInPastError.
+  Step 4: Set expired flag:
+          - if maturity_date < today → expired = "Y"
+          - else → expired = "N"
+          (Note: step 3 means we never reach here with a past date via the normal
+           flow, but this handles edge cases like dates inserted directly to DB.)
+  Step 5: Look up whether a trade with this trade_id already exists in the DB.
+  Step 6a: If EXISTS:
+           - RULE 1 CHECK — if incoming version < stored version → raises LowerVersionError
+           - If version >= stored version → UPDATE the existing record in-place
+  Step 6b: If NOT EXISTS:
+           - INSERT a new Trade record into the database
+  Step 7: Commit to DB, refresh the object, return it.
+
+───────────────────────────────────────────────────────────────────────────────
+store_trades_bulk(payloads: list) → dict
+───────────────────────────────────────────────────────────────────────────────
+PURPOSE: Process a list of trade payloads in one call (batch insert).
+
+LOGIC:
+  Loops through each payload and calls store_trade() for each one.
+  - If store_trade() succeeds: adds the trade to the "stored" list.
+  - If store_trade() raises LowerVersionError, MaturityDateInPastError,
+    or ValueError: catches the error and adds the error message to "errors" list.
+  - Does NOT stop processing if one trade fails (partial success allowed).
+
+RETURNS:
+  {
+    "stored": [ list of successfully stored trade dicts ],
+    "errors": [ list of error messages for failed trades ]
+  }
+
+───────────────────────────────────────────────────────────────────────────────
+get_all_trades() → List[Trade]
+───────────────────────────────────────────────────────────────────────────────
+PURPOSE: Return all trades from the database.
+RETURNS: List of Trade objects, sorted by trade_id then version (ascending).
+
+───────────────────────────────────────────────────────────────────────────────
+get_trade_by_id(trade_id: str) → Trade
+───────────────────────────────────────────────────────────────────────────────
+PURPOSE: Return a single trade by its trade_id.
+RAISES: TradeNotFoundError if no trade with that id exists.
+
+───────────────────────────────────────────────────────────────────────────────
+delete_trade(trade_id: str) → None
+───────────────────────────────────────────────────────────────────────────────
+PURPOSE: Delete a trade from the database.
+LOGIC: Calls get_trade_by_id() first (raises TradeNotFoundError if not found),
+       then deletes it from the DB session and commits.
+
+───────────────────────────────────────────────────────────────────────────────
+expire_matured_trades() → int
+───────────────────────────────────────────────────────────────────────────────
+PURPOSE: Scan all trades and mark expired ones.
+LOGIC:
+  - Queries all trades where maturity_date < today AND expired = "N"
+  - For each such trade, sets expired = "Y"
+  - Commits all changes
+RETURNS: Number of trades that were updated.
+
+───────────────────────────────────────────────────────────────────────────────
+Private helper methods
+───────────────────────────────────────────────────────────────────────────────
+_require(payload, field):
+  Extracts a field from the payload dict.
+  Raises ValueError if the field is missing or empty.
+
+_parse_date(payload, field, trade_id):
+  Tries to parse a date string from the payload.
+  Accepts three formats: DD/MM/YYYY, YYYY-MM-DD, DD-MM-YYYY.
+  Also accepts actual Python date objects (passes them through unchanged).
+  Raises ValueError if the format is not recognized.
+
+================================================================================
+13. THE ROUTES / API ENDPOINTS (app/routes/trade_routes.py)
+================================================================================
+
+File: app/routes/trade_routes.py
+
+This file defines a Flask Blueprint named "trades". It contains the 6 HTTP
+endpoints that clients can call. The routes are intentionally thin — they:
+  1. Parse the incoming HTTP request (JSON body, URL parameters)
+  2. Call the TradeService to do the actual work
+  3. Convert the result to a JSON HTTP response
+  4. Catch exceptions and return appropriate error responses
+
+A single TradeService instance is created at module level:
+  _svc = TradeService()
+
+This means all requests share the same service instance (stateless by design).
+
+The _error() helper:
+  A small helper function that returns a JSON error response:
+  _error("message", status_code) → {"error": "message"}, status_code
+
+================================================================================
+14. ALL API ENDPOINTS EXPLAINED
+================================================================================
+
+Base URL: http://localhost:5000/api/v1
+
+───────────────────────────────────────────────────────────────────────────────
+ENDPOINT 1: GET /api/v1/trades
+───────────────────────────────────────────────────────────────────────────────
+PURPOSE: Get a list of all trades stored in the system.
+REQUEST: No body needed. Just send a GET request.
+RESPONSE: 200 OK with a JSON array of all trades.
+
+Example response:
+[
+  {
+    "id": 1,
+    "trade_id": "T1",
+    "version": 1,
+    "counter_party_id": "CP-1",
+    "portfolio_id": "B1",
+    "maturity_date": "20/05/2030",
+    "created_date": "17/10/2026",
+    "expired": "N"
+  },
+  { ... }
+]
+
+If no trades exist: returns empty array []
+
+───────────────────────────────────────────────────────────────────────────────
+ENDPOINT 2: GET /api/v1/trades/<trade_id>
+───────────────────────────────────────────────────────────────────────────────
+PURPOSE: Get a single trade by its ID.
+REQUEST: trade_id in the URL path.
+RESPONSES:
+  200 OK         → trade object
+  404 Not Found  → {"error": "Trade 'T99' not found."}
+
+Example: GET /api/v1/trades/T1
+
+───────────────────────────────────────────────────────────────────────────────
+ENDPOINT 3: POST /api/v1/trades
+───────────────────────────────────────────────────────────────────────────────
+PURPOSE: Store a single new trade.
+REQUEST BODY (JSON):
+  {
+    "trade_id": "T1",
+    "version": 1,
+    "counter_party_id": "CP-1",
+    "portfolio_id": "B1",
+    "maturity_date": "20/05/2030",
+    "created_date": "17/10/2026"    ← optional, defaults to today
+  }
+
+RESPONSES:
+  201 Created           → stored trade object
+  400 Bad Request       → {"error": "..."} (lower version or past maturity)
+  422 Unprocessable     → {"error": "Request body must be valid JSON."}
+
+───────────────────────────────────────────────────────────────────────────────
+ENDPOINT 4: POST /api/v1/trades/bulk
+───────────────────────────────────────────────────────────────────────────────
+PURPOSE: Store multiple trades in one request (batch).
+REQUEST BODY (JSON array):
+  [
+    { "trade_id": "T1", "version": 1, ... },
+    { "trade_id": "T2", "version": 2, ... },
+    { "trade_id": "T3", "version": 3, "maturity_date": "20/05/2014" }
+  ]
+
+RESPONSE: 207 Multi-Status (always, even if some failed):
+  {
+    "stored": [ { trade1 }, { trade2 } ],
+    "errors": [ "Trade 'T3': maturity date 20/05/2014 is in the past. Trade rejected." ]
+  }
+
+  422 Unprocessable → if body is not a JSON array
+
+NOTE: Invalid trades do not stop valid ones from being saved.
+
+───────────────────────────────────────────────────────────────────────────────
+ENDPOINT 5: DELETE /api/v1/trades/<trade_id>
+───────────────────────────────────────────────────────────────────────────────
+PURPOSE: Delete a trade from the store.
+REQUEST: trade_id in the URL path.
+RESPONSES:
+  200 OK         → {"message": "Trade 'T1' deleted successfully."}
+  404 Not Found  → {"error": "Trade 'T1' not found."}
+
+Example: DELETE /api/v1/trades/T1
+
+───────────────────────────────────────────────────────────────────────────────
+ENDPOINT 6: POST /api/v1/trades/expire
+───────────────────────────────────────────────────────────────────────────────
+PURPOSE: Scan all trades and mark expired ones.
+REQUEST: No body needed.
+RESPONSE: 200 OK
+  {"message": "3 trade(s) marked as expired."}
+
+This is typically called by a scheduled nightly cron job. It finds all trades
+where maturity_date < today AND expired = "N", and sets their expired = "Y".
+
+================================================================================
+15. HOW DATA FLOWS THROUGH THE APPLICATION
+================================================================================
+
+Here is what happens when you call POST /api/v1/trades:
+
+  HTTP Client (curl/Postman)
+        |
+        | HTTP POST request with JSON body
+        ↓
+  Flask Router (trade_routes.py)
+        |
+        | create_trade() function is called
+        | Parses JSON body from request
+        ↓
+  TradeService.store_trade(data)
+        |
+        | Step 1: Validate required fields (_require helper)
+        | Step 2: Parse date strings (_parse_date helper)
+        | Step 3: Check maturity_date < today → raise MaturityDateInPastError?
+        | Step 4: Set expired flag
+        | Step 5: Query DB for existing trade_id
+        | Step 6a: If exists → check version → update or raise LowerVersionError
+        | Step 6b: If not exists → insert new record
+        | Step 7: db.session.commit()
+        ↓
+  SQLAlchemy ORM
+        |
+        | Executes SQL INSERT or UPDATE
+        ↓
+  SQLite Database (trade_store_dev.db)
+        |
+        | Data persisted to file
+        ↑
+  Result flows back up the chain:
+        Trade object → to_dict() → JSON → HTTP 201 response to client
+
+If an error occurs at any step, an exception is raised, caught in the route
+function, and returned as an appropriate HTTP error response (400, 404, 422).
+
+================================================================================
+16. DEPENDENCIES
+================================================================================
+
+FILE: requirements.txt (production/runtime dependencies)
+────────────────────────────────────────────────────────
+Flask==2.3.3               Web framework
+Flask-SQLAlchemy==3.1.1    SQLAlchemy integration for Flask
+SQLAlchemy==2.0.23         ORM (database abstraction)
+Werkzeug==2.3.7            Flask's HTTP utilities (request/response)
+python-dateutil==2.8.2     Flexible date parsing
+marshmallow==3.20.1        Data serialization/validation (available for use)
+
+FILE: requirements-dev.txt (development + test dependencies)
+─────────────────────────────────────────────────────────────
+-r requirements.txt        Includes all production deps
+pytest==7.4.3              Test runner
+pytest-cov==4.1.0          Code coverage measurement
+safety==3.2.3              Security vulnerability scanning
+
+Install all (for development):
+  pip install -r requirements-dev.txt
+
+Install only production deps:
+  pip install -r requirements.txt
+
+================================================================================
+17. TESTS — OVERVIEW
+================================================================================
+
+The project has 80 tests with 99% code coverage.
+Tests are in the tests/ directory and split into 4 files:
+
+File                  | Tests | What it tests
+----------------------|-------|-----------------------------------------------
+test_models.py        | 5     | The Trade database model
+test_service.py       | 30+   | All TradeService methods and business rules
+test_routes.py        | 30+   | All API endpoints (integration tests)
+test_exceptions.py    | 11    | All custom exception classes
+
+Tests are written using pytest.
+
+To run all tests:
+  pytest tests/ --cov=app --cov-report=term-missing
+
+================================================================================
+18. TEST FIXTURES (tests/conftest.py)
+================================================================================
+
+File: tests/conftest.py
+
+Fixtures are reusable setup pieces shared across test files. pytest uses them
+like "dependency injection" — you just name the fixture in a test function's
+parameters and pytest provides the value.
+
+───────────────────────────────────────────────────────────────────────────────
+app fixture (session-scoped)
+───────────────────────────────────────────────────────────────────────────────
+Creates one Flask app in "testing" mode for the entire test session.
+Testing config = in-memory SQLite database (no file, no leftover state).
+
+───────────────────────────────────────────────────────────────────────────────
+_db_session_create fixture (session-scoped)
+───────────────────────────────────────────────────────────────────────────────
+Creates all database tables once at the start of the test session.
+Drops all tables at the end of the test session.
+
+───────────────────────────────────────────────────────────────────────────────
+db fixture (function-scoped)
+───────────────────────────────────────────────────────────────────────────────
+Provides a CLEAN database for each individual test:
+  - After each test: rolls back any uncommitted changes
+  - Deletes all rows from all tables
+  - Commits to ensure next test starts fresh
+This ensures tests are completely isolated from each other.
+
+───────────────────────────────────────────────────────────────────────────────
+client fixture
+───────────────────────────────────────────────────────────────────────────────
+Provides a Flask test client with a clean database.
+The test client lets you make HTTP requests to the app without starting a server.
+
+───────────────────────────────────────────────────────────────────────────────
+Date helper fixtures
+───────────────────────────────────────────────────────────────────────────────
+future_date  → A date 365 days from today (e.g., "17/10/2027"), as DD/MM/YYYY
+past_date    → "20/05/2014" (clearly in the past)
+today_str    → Today's date as DD/MM/YYYY
+
+───────────────────────────────────────────────────────────────────────────────
+Sample trade payload fixtures
+───────────────────────────────────────────────────────────────────────────────
+trade_t1 → { trade_id: "T1", version: 1, counter_party_id: "CP-1",
+              portfolio_id: "B1", maturity_date: future_date }
+trade_t2 → { trade_id: "T2", version: 2, ... }
+trade_t3 → { trade_id: "T3", version: 3, ... }
+
+================================================================================
+19. MODEL TESTS (tests/test_models.py)
+================================================================================
+
+File: tests/test_models.py
+Class: TestTradeModel
+
+Tests the Trade database model directly.
+
+Test 1: test_trade_creation_defaults
+  Verifies that when you create a Trade without specifying created_date or
+  expired, they default to today and "N" respectively.
+
+Test 2: test_trade_to_dict_keys
+  Verifies that to_dict() returns all 8 expected keys:
+  id, trade_id, version, counter_party_id, portfolio_id,
+  maturity_date, created_date, expired
+
+Test 3: test_trade_to_dict_date_format
+  Verifies that dates in to_dict() use DD/MM/YYYY format.
+  Example: date(2026, 12, 31) → "31/12/2026"
+
+Test 4: test_trade_repr
+  Verifies that __repr__ shows trade_id, version, and expired in the string.
+
+Test 5: test_unique_constraint_on_trade_id
+  Verifies that you cannot insert two Trade rows with the same trade_id.
+  SQLAlchemy should raise an IntegrityError.
+
+================================================================================
+20. SERVICE TESTS (tests/test_service.py)
+================================================================================
+
+File: tests/test_service.py
+
+These are unit tests for the TradeService class. They test business logic
+directly without going through HTTP.
+
+Classes and what they test:
+
+TestStoreTrade:
+  - test_store_new_trade: New trade_id → inserted successfully
+  - test_store_trade_sets_created_date_today: created_date defaults to today
+  - test_store_trade_with_explicit_created_date: Supplied created_date is used
+  - test_store_trade_returns_trade_instance: Returns a Trade ORM object
+  - test_same_version_replaces_record: v1 then v1 again → second overwrites first
+  - test_higher_version_replaces_record: v1 then v2 → v2 replaces v1
+  - test_upsert_does_not_create_duplicate: After upsert, only 1 row in DB
+  - test_lower_version_raises_error: v5 stored, v3 arrives → LowerVersionError
+  - test_lower_version_does_not_modify_stored_trade: Rejected trade leaves DB unchanged
+  - test_past_maturity_date_raises_error: Past date → MaturityDateInPastError
+  - test_maturity_today_is_accepted: Today's date is NOT rejected
+  - test_maturity_tomorrow_is_accepted: Tomorrow's date is accepted
+  - test_future_maturity_sets_expired_n: Future date → expired = "N"
+  - test_missing_trade_id_raises_value_error: Missing field raises ValueError
+  - test_missing_version_raises_value_error: Same
+  - test_missing_maturity_date_raises_value_error: Same
+  - test_invalid_date_format_raises_value_error: "not-a-date" raises ValueError
+  - test_iso_date_format_accepted: YYYY-MM-DD format works
+  - test_problem_statement_t1/t2/t3/lower_version_t2: Problem statement scenarios
+
+TestStoreTradeBulk:
+  - test_bulk_all_valid: 2 valid trades → both stored
+  - test_bulk_partial_failure: 1 valid + 1 invalid → 1 stored, 1 error
+  - test_bulk_all_invalid: 2 invalid → 0 stored, 2 errors
+  - test_bulk_empty_list: [] → {"stored":[], "errors":[]}
+
+TestGetAllTrades:
+  - test_returns_all_stored_trades: All stored trades are returned
+  - test_returns_empty_list_when_no_trades: Empty DB → empty list
+
+TestGetTradeById:
+  - test_returns_correct_trade: Returns the right trade
+  - test_raises_not_found_for_missing_id: TradeNotFoundError raised
+
+TestDeleteTrade:
+  - test_delete_existing_trade: Trade is gone after delete
+  - test_delete_nonexistent_trade_raises: TradeNotFoundError raised
+
+TestExpireMaturedTrades:
+  - test_expires_matured_trades: Past-maturity trade gets expired="Y"
+  - test_does_not_expire_future_trades: Future trade stays expired="N"
+  - test_already_expired_trades_not_counted_again: Already "Y" → not counted
+  - test_returns_zero_when_no_trades_to_expire: Empty DB → count=0
+
+================================================================================
+21. ROUTE / INTEGRATION TESTS (tests/test_routes.py)
+================================================================================
+
+File: tests/test_routes.py
+
+These are integration tests. They test the full HTTP request/response cycle,
+going through the routes → service → database → back to response.
+
+Uses the Flask test client (client fixture) which makes real HTTP calls to the
+in-memory test app without needing a running server.
+
+Helper functions defined in the file:
+  _future(days)       → date string N days from today
+  _past(days)         → date string N days ago
+  _post(client, data) → makes a POST /api/v1/trades request
+  _base_payload()     → returns a default valid trade dict
+
+Classes and what they test:
+
+TestCreateTrade (POST /api/v1/trades):
+  - Creates trade → 201 status
+  - Response body has correct fields
+  - Past maturity → 400
+  - Lower version → 400
+  - Same version → 201 (overwrites)
+  - Higher version → 201 (overwrites)
+  - Missing field → 400
+  - Non-JSON body → 422
+  - Empty body → 422
+  - Today's maturity → 201 (accepted)
+  - Problem statement scenarios (T1, T2, T3)
+
+TestListTrades (GET /api/v1/trades):
+  - Empty store → 200 + []
+  - Returns all stored trades
+  - Response is a JSON array
+
+TestGetTrade (GET /api/v1/trades/<trade_id>):
+  - Existing trade → 200 + trade data
+  - Non-existent → 404
+  - Shows latest version after upsert
+
+TestDeleteTrade (DELETE /api/v1/trades/<trade_id>):
+  - Delete existing → 200 + "deleted" message
+  - Deleted trade → 404 on subsequent GET
+  - Delete non-existent → 404
+
+TestBulkCreate (POST /api/v1/trades/bulk):
+  - All valid → 207 + 2 stored, 0 errors
+  - Partial failure → 207 + 1 stored, 1 error
+  - Non-array body → 422
+
+TestExpireTrades (POST /api/v1/trades/expire):
+  - Returns 200
+  - Response contains "trade(s) marked as expired"
+  - Actually marks past-maturity trades as expired="Y"
+
+================================================================================
+22. EXCEPTION TESTS (tests/test_exceptions.py)
+================================================================================
+
+File: tests/test_exceptions.py
+Class: TestExceptions
+
+Tests the exception classes in isolation.
+
+11 tests covering:
+  - LowerVersionError is an instance of TradeStoreError
+  - LowerVersionError has status_code = 400
+  - LowerVersionError message contains trade_id, incoming version, stored version
+  - LowerVersionError attributes (trade_id, incoming_version, stored_version)
+  - MaturityDateInPastError is an instance of TradeStoreError
+  - MaturityDateInPastError has status_code = 400
+  - MaturityDateInPastError message contains trade_id and date
+  - TradeNotFoundError is an instance of TradeStoreError
+  - TradeNotFoundError has status_code = 404
+  - TradeNotFoundError message contains trade_id
+  - All exceptions are catchable as TradeStoreError (base class)
+
+================================================================================
+23. CI/CD PIPELINE (.github/workflows/ci.yml)
+================================================================================
+
+File: .github/workflows/ci.yml
+
+This file configures GitHub Actions — an automated system that runs every time
+you push code to GitHub or create a pull request.
+
+WHEN IT RUNS:
+  - On every push to any branch
+  - On pull requests targeting main or master
+
+THE 3 JOBS:
+
+───────────────────────────────────────────────────────────────────────────────
+JOB 1: Regression Tests
+───────────────────────────────────────────────────────────────────────────────
+Runs on: Ubuntu Linux
+Matrix: Tests on Python 3.9, 3.10, AND 3.11 (3 parallel runs)
+Steps:
+  1. Checkout code from GitHub
+  2. Set up the specified Python version
+  3. Install requirements-dev.txt
+  4. Run pytest with coverage
+     - Coverage threshold: 90% minimum (build fails if below)
+     - Saves JUnit XML report (junit-3.9.xml etc.)
+     - Saves coverage XML report
+  5. Upload reports as GitHub Actions artifacts
+
+FAILS IF: Any test fails OR coverage drops below 90%.
+
+───────────────────────────────────────────────────────────────────────────────
+JOB 2: OSS Vulnerability Scan
+───────────────────────────────────────────────────────────────────────────────
+Runs AFTER Job 1 completes (needs: test)
+Uses: safety check tool
+Steps:
+  1. Checkout code
+  2. Set up Python 3.11
+  3. Install dependencies + safety
+  4. Run: safety check --file requirements.txt
+     - Scans all packages in requirements.txt against known CVE databases
+     - Saves JSON report
+  5. Upload safety report as artifact
+
+FAILS IF: Any Critical or High severity CVEs are found in dependencies.
+
+───────────────────────────────────────────────────────────────────────────────
+JOB 3: Code Quality (flake8)
+───────────────────────────────────────────────────────────────────────────────
+Runs independently (no dependency on job 1 or 2)
+Uses: flake8 linter
+Steps:
+  1. Checkout code
+  2. Set up Python 3.11
+  3. Install flake8==7.0.0
+  4. Run: flake8 app/ run.py
+     - max line length: 100 characters
+     - Ignores: E203 (whitespace before ':'), W503 (line break before binary op)
+
+FAILS IF: Any flake8 style violations are found.
+
+CI/CD STATUS BADGES (shown in README):
+  - CI badge: shows pass/fail status of the pipeline
+  - Python badge: 3.9 | 3.10 | 3.11
+  - Coverage badge: 99%
+  - Tests badge: 80 passed
+
+================================================================================
+24. HOW TO RUN THE PROJECT
+================================================================================
+
+STEP 1: Make sure Python 3.9+ is installed
+  python --version
+  # Should show Python 3.9.x or higher
+
+STEP 2: Go to the project directory
+  cd /Users/manishborse/PycharmProjects/TradeStoreDB
+
+STEP 3: Create and activate a virtual environment
+  python -m venv .venv
+  source .venv/bin/activate         ← Mac/Linux
+  # .venv\Scripts\activate          ← Windows
+
+  Your terminal should show (.venv) at the start of the prompt.
+
+STEP 4: Install dependencies
+  pip install -r requirements-dev.txt
+
+STEP 5: Start the server
+  python run.py
+
+  Expected output:
+   * Running on http://0.0.0.0:5000
+   * Debug mode: on
+
+STEP 6: Test the server is working
+  Open a new terminal and run:
+  curl http://localhost:5000/api/v1/trades
+
+  Expected output: []  (empty array, no trades yet)
+
+================================================================================
+25. HOW TO RUN THE TESTS
+================================================================================
+
+Make sure your virtual environment is active and you are in the project root.
+
+Run all tests with coverage report:
+  pytest tests/ --cov=app --cov-report=term-missing
+
+Run only service tests (verbose):
+  pytest tests/test_service.py -v
+
+Run only route tests (verbose):
+  pytest tests/test_routes.py -v
+
+Run only model tests:
+  pytest tests/test_models.py -v
+
+Run only exception tests:
+  pytest tests/test_exceptions.py -v
+
+Run a specific test by name:
+  pytest tests/test_service.py::TestStoreTrade::test_lower_version_raises_error -v
+
+Expected output from full run:
+  80 passed in ~0.2s
+  Coverage: 99%
+
+================================================================================
+26. COMMON ERRORS AND WHAT THEY MEAN
+================================================================================
+
+ERROR: ModuleNotFoundError: No module named 'flask'
+FIX:   Virtual environment is not activated or dependencies not installed.
+       Run: source .venv/bin/activate && pip install -r requirements-dev.txt
+
+ERROR: Address already in use (port 5000)
+FIX:   Another process is using port 5000. Kill it:
+       lsof -i :5000  → find the PID
+       kill <PID>
+       Or use a different port: app.run(port=5001)
+
+ERROR: {"error": "Request body must be valid JSON."}  (HTTP 422)
+FIX:   Your request body is missing or not valid JSON. Make sure:
+       - Content-Type header is "application/json"
+       - Body is valid JSON
+
+ERROR: {"error": "Trade 'T2': incoming version 1 is lower than stored version 2..."}  (HTTP 400)
+MEANING: You tried to store T2 v1 but T2 v2 is already in the DB.
+FIX:   Use version 2 or higher.
+
+ERROR: {"error": "Trade 'T3': maturity date 20/05/2014 is in the past..."}  (HTTP 400)
+MEANING: The maturity date you provided is before today.
+FIX:   Use a future date (e.g., "20/05/2030").
+
+ERROR: {"error": "Trade 'T99' not found."}  (HTTP 404)
+MEANING: You tried to GET or DELETE a trade_id that does not exist.
+FIX:   Check the trade_id or first create it with POST /api/v1/trades.
+
+ERROR: ValueError: Field 'trade_id' is required and cannot be empty.  (HTTP 400)
+MEANING: You forgot to include a required field in the request body.
+FIX:   Include all required fields: trade_id, version, counter_party_id,
+       portfolio_id, maturity_date.
+
+ERROR: ValueError: 'maturity_date' value 'tomorrow' is not a recognised date format.
+MEANING: The date string format is wrong.
+FIX:   Use DD/MM/YYYY (e.g., "20/05/2030") or YYYY-MM-DD (e.g., "2030-05-20").
+
+================================================================================
+27. SAMPLE API REQUESTS (curl Commands)
+================================================================================
+
+All examples assume the server is running at http://localhost:5000
+
+--- Store a single trade ---
+curl -X POST http://localhost:5000/api/v1/trades \
+  -H "Content-Type: application/json" \
+  -d '{
+    "trade_id": "T1",
+    "version": 1,
+    "counter_party_id": "CP-1",
+    "portfolio_id": "B1",
+    "maturity_date": "20/05/2030",
+    "created_date": "17/10/2026"
+  }'
+
+--- List all trades ---
+curl http://localhost:5000/api/v1/trades
+
+--- Get a single trade ---
+curl http://localhost:5000/api/v1/trades/T1
+
+--- Delete a trade ---
+curl -X DELETE http://localhost:5000/api/v1/trades/T1
+
+--- Bulk store trades ---
+curl -X POST http://localhost:5000/api/v1/trades/bulk \
+  -H "Content-Type: application/json" \
+  -d '[
+    {"trade_id":"T1","version":1,"counter_party_id":"CP-1","portfolio_id":"B1","maturity_date":"20/05/2030"},
+    {"trade_id":"T2","version":2,"counter_party_id":"CP-2","portfolio_id":"B1","maturity_date":"20/05/2030"},
+    {"trade_id":"T3","version":3,"counter_party_id":"CP-3","portfolio_id":"B2","maturity_date":"20/05/2014"}
+  ]'
+
+Expected bulk response:
+{
+  "stored": [
+    {"id":1,"trade_id":"T1","version":1,...},
+    {"id":2,"trade_id":"T2","version":2,...}
+  ],
+  "errors": [
+    "Trade 'T3': maturity date 20/05/2014 is in the past. Trade rejected."
+  ]
+}
+
+--- Trigger expiry scan ---
+curl -X POST http://localhost:5000/api/v1/trades/expire
+
+================================================================================
+28. GLOSSARY OF TERMS
+================================================================================
+
+API (Application Programming Interface)
+  A way for programs to communicate. This project exposes an HTTP REST API
+  so external systems can send/receive trade data.
+
+Blueprint (Flask)
+  A way to organize related routes in Flask. Like a mini-app that gets
+  registered onto the main app with a URL prefix.
+
+CI/CD (Continuous Integration / Continuous Deployment)
+  Automated pipelines that run tests and checks every time code is pushed.
+
+Counter-Party
+  In finance, the other party in a trade. In this project, stored as CP-1, CP-2 etc.
+
+Coverage (Test Coverage)
+  The percentage of your code that is exercised by tests. 99% means almost
+  every line of code is tested.
+
+CVE (Common Vulnerabilities and Exposures)
+  Public security vulnerabilities in software packages. Safety tool scans for these.
+
+Expired Trade
+  A trade whose maturity_date has passed. Marked with expired="Y" in the database.
+
+Fixture (pytest)
+  Reusable setup/teardown code for tests. Defined in conftest.py.
+
+Flask
+  A lightweight Python web framework for building web applications and APIs.
+
+flake8
+  A Python code style checker that enforces PEP 8 style guidelines.
+
+Maturity Date
+  The date on which a financial trade settles or expires.
+
+ORM (Object-Relational Mapper)
+  A tool that lets you work with database tables as Python objects.
+  SQLAlchemy is the ORM used here.
+
+Payload
+  The data sent in an HTTP request body, usually in JSON format.
+
+Portfolio ID
+  Identifier for the investment portfolio. Stored as B1, B2 etc.
+
+REST (Representational State Transfer)
+  An architectural style for HTTP APIs using standard methods: GET, POST,
+  PUT, DELETE.
+
+SQLAlchemy
+  A Python ORM library that maps Python classes to database tables and
+  handles SQL queries.
+
+SQLite
+  A lightweight file-based (or in-memory) SQL database. No server needed.
+  Used here for development and testing.
+
+Status Code (HTTP)
+  A number indicating the result of an HTTP request:
+  200 = OK, 201 = Created, 207 = Multi-Status, 400 = Bad Request,
+  404 = Not Found, 422 = Unprocessable Entity
+
+Upsert
+  A database operation that either inserts a new row (if not exists) or
+  updates an existing row (if exists). Used for trade version replacement.
+
+Virtual Environment (.venv)
+  An isolated Python environment for a project so packages don't conflict
+  with other projects on your machine.
+
+Version
+  An integer indicating the revision number of a trade. Higher = newer.
+
+Trade ID
+  The business identifier for a trade (T1, T2, T3...). The primary way
+  to look up a trade.
+
+================================================================================
+                              END OF DOCUMENTATION
+================================================================================
