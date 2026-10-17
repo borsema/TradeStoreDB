@@ -1,0 +1,119 @@
+name: Trade Store CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 1. Regression Tests
+  # ─────────────────────────────────────────────────────────────────────────────
+  test:
+    name: Regression Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ \
+            --tb=short \
+            --junitxml=reports/junit-${{ matrix.python-version }}.xml \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml:reports/coverage-${{ matrix.python-version }}.xml \
+            --cov-fail-under=90
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: reports/
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 2. OSS Vulnerability Scan (Safety)
+  #    Build fails on CRITICAL or HIGH severity CVEs
+  # ─────────────────────────────────────────────────────────────────────────────
+  vulnerability-scan:
+    name: OSS Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies + Safety
+        run: |
+          pip install -r requirements.txt
+          pip install safety==3.2.3
+
+      - name: Run Safety vulnerability scan
+        # Exit code 64 = vulnerabilities found (non-zero → build fails)
+        # --ignore is used only for false positives you have triaged.
+        run: |
+          safety check \
+            --file requirements.txt \
+            --output text \
+            --short-report \
+            --save-json reports/safety-report.json \
+            || (echo "::error::Critical/High OSS vulnerabilities detected. Build failed." && exit 1)
+
+      - name: Upload Safety report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: safety-vulnerability-report
+          path: reports/safety-report.json
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 3. Code Quality — flake8 lint
+  # ─────────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Code Quality (flake8)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install flake8
+        run: pip install flake8==7.0.0
+
+      - name: Run flake8
+        run: |
+          flake8 app/ run.py \
+            --max-line-length=100 \
+            --extend-ignore=E203,W503 \
+            --statistics

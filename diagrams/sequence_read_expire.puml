@@ -1,0 +1,86 @@
+@startuml sequence_read_expire
+!theme plain
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 8
+skinparam backgroundColor #FAFAFA
+
+title "Trade Store — Read & Expire Flows"
+
+actor       "Client"         as C
+participant "Flask Router"   as R
+participant "TradeService"   as S
+database    "SQLite DB"      as DB
+
+== GET /api/v1/trades — List All ==
+
+C  ->  R : GET /api/v1/trades
+activate R
+R  ->  S : get_all_trades()
+activate S
+S  ->  DB : SELECT * FROM trade\nORDER BY trade_id, version
+DB --> S : [Trade, …]
+S  --> R : list of Trade
+deactivate S
+R  --> C : 200 OK\n[{…}, {…}, …]
+deactivate R
+
+== GET /api/v1/trades/<id> — Single Trade ==
+
+C  ->  R : GET /api/v1/trades/T2
+activate R
+R  ->  S : get_trade_by_id("T2")
+activate S
+S  ->  DB : SELECT * FROM trade\nWHERE trade_id = 'T2'
+alt trade found
+    DB --> S : Trade
+    S  --> R : Trade
+    R  --> C : 200 OK\n{trade JSON}
+else trade not found
+    DB --> S : None
+    S  --> R : TradeNotFoundError("T2")
+    R  --> C : 404 Not Found\n{error: "Trade 'T2' not found."}
+end
+deactivate S
+deactivate R
+
+== POST /api/v1/trades/expire — Expire Matured Trades ==
+
+C  ->  R : POST /api/v1/trades/expire
+activate R
+note left: Typically triggered\nby a nightly scheduler
+
+R  ->  S : expire_matured_trades()
+activate S
+S  ->  DB : SELECT * FROM trade\nWHERE maturity_date < TODAY\n  AND expired = 'N'
+DB --> S : [matured trades]
+loop for each matured trade
+    S  ->  DB : UPDATE trade\nSET expired='Y'\nWHERE id = ?
+    DB --> S : OK
+end
+S  --> R : count (int)
+deactivate S
+R  --> C : 200 OK\n{"message": "3 trade(s) marked as expired."}
+deactivate R
+
+== DELETE /api/v1/trades/<id> ==
+
+C  ->  R : DELETE /api/v1/trades/T1
+activate R
+R  ->  S : delete_trade("T1")
+activate S
+S  ->  DB : SELECT * FROM trade\nWHERE trade_id = 'T1'
+alt found
+    DB --> S : Trade
+    S  ->  DB : DELETE FROM trade\nWHERE id = ?
+    DB --> S : OK
+    S  --> R : None
+    R  --> C : 200 OK\n{"message": "Trade 'T1' deleted successfully."}
+else not found
+    DB --> S : None
+    S  --> R : TradeNotFoundError("T1")
+    R  --> C : 404 Not Found
+end
+deactivate S
+deactivate R
+
+@enduml

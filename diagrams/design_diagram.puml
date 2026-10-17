@@ -1,0 +1,74 @@
+@startuml design_diagram
+!theme plain
+skinparam componentStyle rectangle
+skinparam backgroundColor #FAFAFA
+skinparam roundcorner 10
+skinparam shadowing false
+
+title "Trade Store — System Architecture"
+
+rectangle "Client Layer" #EAF2FB {
+    [REST Client\n(curl / Postman / upstream system)] as CLIENT
+}
+
+rectangle "API Layer (Flask)" #EAF9EF {
+    rectangle "Blueprint: /api/v1" {
+        [GET /trades]           as GET_ALL
+        [GET /trades/<id>]      as GET_ONE
+        [POST /trades]          as POST_ONE
+        [POST /trades/bulk]     as POST_BULK
+        [DELETE /trades/<id>]   as DELETE
+        [POST /trades/expire]   as EXPIRE
+    }
+}
+
+rectangle "Service Layer" #FEF9E7 {
+    [TradeService] as SVC
+    note right of SVC
+      Business Rules:
+      ├─ Reject lower version
+      ├─ Reject past maturity date
+      └─ Auto-expire matured trades
+    end note
+}
+
+rectangle "Domain / Model Layer" #FDEDEC {
+    [Trade (SQLAlchemy Model)] as MODEL
+    [TradeStoreError\n(Exception Hierarchy)] as EXC
+}
+
+rectangle "Persistence Layer" #F4ECF7 {
+    database "SQLite Database\n(trade_store.db)" as DB
+}
+
+rectangle "CI / CD Pipeline\n(GitHub Actions)" #EEEEEE {
+    [Regression Tests\n(pytest / 3.9 · 3.10 · 3.11)] as TEST
+    [Safety Vulnerability Scan] as SCAN
+    [flake8 Lint] as LINT
+}
+
+' Flows
+CLIENT --> GET_ALL
+CLIENT --> GET_ONE
+CLIENT --> POST_ONE
+CLIENT --> POST_BULK
+CLIENT --> DELETE
+CLIENT --> EXPIRE
+
+GET_ALL   --> SVC
+GET_ONE   --> SVC
+POST_ONE  --> SVC
+POST_BULK --> SVC
+DELETE    --> SVC
+EXPIRE    --> SVC
+
+SVC --> MODEL
+SVC --> EXC : raises
+MODEL --> DB : read / write
+
+TEST -[dashed]-> SVC : tests
+TEST -[dashed]-> MODEL : tests
+SCAN -[dashed]-> DB : scan deps
+LINT -[dashed]-> SVC : lint
+
+@enduml

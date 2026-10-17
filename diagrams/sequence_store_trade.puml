@@ -1,0 +1,94 @@
+@startuml sequence_store_trade
+!theme plain
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 8
+skinparam backgroundColor #FAFAFA
+skinparam ParticipantPadding 20
+skinparam BoxPadding 10
+
+title "Trade Store — POST /api/v1/trades : Store a Single Trade"
+
+actor       "Client"         as C
+participant "Flask Router"   as R
+participant "TradeService"   as S
+participant "Trade (Model)"  as M
+database    "SQLite DB"      as DB
+
+== Happy Path: New Trade ==
+
+C  ->  R : POST /api/v1/trades\n{trade_id, version, counter_party_id,\n portfolio_id, maturity_date}
+activate R
+
+R  ->  S : store_trade(payload)
+activate S
+
+S  ->  S : validate required fields
+note right: Raises ValueError\nif any field is missing
+
+S  ->  S : parse maturity_date
+S  ->  S : check maturity_date >= today
+note right: Raises MaturityDateInPastError\nif maturity_date < today
+
+S  ->  DB : SELECT * FROM trade\n WHERE trade_id = ?
+DB --> S : None (trade not found)
+
+S  ->  M : Trade(trade_id, version, …)
+activate M
+M  --> S : trade instance
+deactivate M
+
+S  ->  DB : INSERT INTO trade (…) VALUES (…)
+DB --> S : OK (auto-generated id)
+
+S  ->  DB : REFRESH trade
+DB --> S : trade with id
+
+S  --> R : Trade instance
+deactivate S
+
+R  --> C : 201 Created\n{trade JSON}
+deactivate R
+
+== Scenario: Same Version (Upsert) ==
+
+C  ->  R : POST /api/v1/trades {version=1}
+activate R
+R  ->  S : store_trade(payload)
+activate S
+S  ->  DB : SELECT * FROM trade WHERE trade_id = ?
+DB --> S : existing trade (version=1)
+S  ->  S : incoming(1) >= stored(1) → update
+S  ->  DB : UPDATE trade SET … WHERE id = ?
+DB --> S : OK
+S  --> R : updated Trade instance
+deactivate S
+R  --> C : 201 Created\n{updated trade JSON}
+deactivate R
+
+== Error: Lower Version ==
+
+C  ->  R : POST /api/v1/trades {version=2}
+activate R
+R  ->  S : store_trade(payload)
+activate S
+S  ->  DB : SELECT * FROM trade WHERE trade_id = ?
+DB --> S : existing trade (version=5)
+S  ->  S : incoming(2) < stored(5) → REJECT
+S  --> R : LowerVersionError("T1", 2, 5)
+deactivate S
+R  --> C : 400 Bad Request\n{error: "Trade 'T1': incoming version 2 is lower…"}
+deactivate R
+
+== Error: Past Maturity Date ==
+
+C  ->  R : POST /api/v1/trades {maturity_date=20/05/2014}
+activate R
+R  ->  S : store_trade(payload)
+activate S
+S  ->  S : maturity_date(2014) < today → REJECT
+S  --> R : MaturityDateInPastError("T3", "20/05/2014")
+deactivate S
+R  --> C : 400 Bad Request\n{error: "Trade 'T3': maturity date … is in the past"}
+deactivate R
+
+@enduml

@@ -1,0 +1,111 @@
+@startuml class_diagram
+!theme plain
+skinparam classAttributeIconSize 0
+skinparam roundcorner 8
+skinparam backgroundColor #FAFAFA
+skinparam shadowing false
+
+title "Trade Store — Class Diagram"
+
+package "app.models" #EAF2FB {
+    class Trade {
+        +id              : Integer  <<PK>>
+        +trade_id        : String   <<unique>>
+        +version         : Integer
+        +counter_party_id: String
+        +portfolio_id    : String
+        +maturity_date   : Date
+        +created_date    : Date
+        +expired         : String
+        --
+        +to_dict() : dict
+        +__repr__() : str
+    }
+}
+
+package "app.services" #EAF9EF {
+    class TradeService {
+        +store_trade(payload: dict) : Trade
+        +store_trades_bulk(payloads: list) : dict
+        +get_all_trades() : List[Trade]
+        +get_trade_by_id(trade_id: str) : Trade
+        +delete_trade(trade_id: str) : None
+        +expire_matured_trades() : int
+        --
+        -_require(payload, field) : str
+        -_parse_date(payload, field, trade_id) : date
+    }
+}
+
+package "app.exceptions" #FEF9E7 {
+    class TradeStoreError <<Exception>> {
+        +status_code : int
+        +message     : str
+    }
+    class LowerVersionError <<Exception>> {
+        +trade_id          : str
+        +incoming_version  : int
+        +stored_version    : int
+        --
+        +status_code = 400
+    }
+    class MaturityDateInPastError <<Exception>> {
+        +trade_id     : str
+        +maturity_date: str
+        --
+        +status_code = 400
+    }
+    class TradeNotFoundError <<Exception>> {
+        +trade_id : str
+        --
+        +status_code = 404
+    }
+}
+
+package "app.routes" #FDEDEC {
+    class TradeRoutes <<Blueprint>> {
+        +list_trades()          : Response
+        +get_trade(id)          : Response
+        +create_trade()         : Response
+        +create_trades_bulk()   : Response
+        +delete_trade(id)       : Response
+        +expire_trades()        : Response
+    }
+}
+
+package "app.extensions" #F4ECF7 {
+    class SQLAlchemy <<Extension>> {
+        +session
+        +Model
+    }
+}
+
+' Relationships
+TradeService ..> Trade             : creates / reads
+TradeService ..> LowerVersionError : raises
+TradeService ..> MaturityDateInPastError : raises
+TradeService ..> TradeNotFoundError : raises
+
+TradeRoutes   ..> TradeService     : delegates to
+TradeRoutes   ..> TradeStoreError  : catches
+
+LowerVersionError       --|> TradeStoreError
+MaturityDateInPastError --|> TradeStoreError
+TradeNotFoundError      --|> TradeStoreError
+
+Trade ..> SQLAlchemy : mapped by
+TradeService ..> SQLAlchemy : uses session
+
+note bottom of Trade
+  One row per active trade_id.
+  UniqueConstraint(trade_id).
+end note
+
+note right of TradeService
+  Business Rules:
+  1. Reject version < stored version
+  2. Reject maturity_date < today
+  3. Auto-expire when maturity passes
+end note
+
+@enduml
